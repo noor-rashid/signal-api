@@ -12,6 +12,7 @@ import websockets
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.binance.com"
+FUTURES_URL = "https://fapi.binance.com"
 WS_URL = "wss://stream.binance.com:9443/ws"
 
 # Binance kline intervals
@@ -48,11 +49,17 @@ def _parse_klines(raw: list[list]) -> pd.DataFrame:
     return df
 
 
+VALID_FUTURES_PERIODS = {
+    "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d",
+}
+
+
 class BinanceClient:
     """Fetch historical and real-time crypto OHLCV data from Binance."""
 
-    def __init__(self, base_url: str = BASE_URL):
+    def __init__(self, base_url: str = BASE_URL, futures_url: str = FUTURES_URL):
         self.base_url = base_url
+        self.futures_url = futures_url
 
     async def fetch_historical(
         self,
@@ -150,6 +157,155 @@ class BinanceClient:
         result = result.drop_duplicates(subset=["open_time", "symbol"]).reset_index(drop=True)
         logger.info(f"Full history: {len(result)} total klines for {symbol}")
         return result
+
+    async def _paginate_futures(
+        self,
+        endpoint: str,
+        symbol: str,
+        period: str | None = None,
+        limit: int = 500,
+        start: str | None = None,
+        max_age_days: int | None = 30,
+        timestamp_col: str = "timestamp",
+    ) -> pd.DataFrame:
+        """Generic paginated fetcher for Binance Futures data endpoints."""
+        params: dict[str, str | int] = {"symbol": symbol.upper(), "limit": limit}
+        if period:
+            if period not in VALID_FUTURES_PERIODS:
+                raise ValueError(f"Invalid period '{period}'. Must be one of {VALID_FUTURES_PERIODS}")
+            params["period"] = period
+
+        # Clamp start time for endpoints with limited history
+        if max_age_days:
+            min_start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max_age_days)
+            if start:
+                start_ts = pd.Timestamp(start, tz="UTC")
+                if start_ts < min_start:
+                    start = min_start.isoformat()
+            else:
+                start = min_start.isoformat()
+
+        if start:
+            params["startTime"] = int(
+                pd.Timestamp(start, tz="UTC").timestamp() * 1000
+            )
+
+        all_frames: list[pd.DataFrame] = []
+        async with httpx.AsyncClient() as client:
+            while True:
+                resp = await client.get(
+                    f"{self.futures_url}{endpoint}",
+                    params=params,
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                raw = resp.json()
+
+                if not raw:
+                    break
+
+                df = pd.DataFrame(raw)
+                all_frames.append(df)
+
+                if len(df) < limit:
+                    break
+
+                # Advance startTime past the last record
+                last_ts = int(df[timestamp_col].iloc[-1])
+                params["startTime"] = last_ts + 1
+
+                await asyncio.sleep(0.1)
+
+        if not all_frames:
+            return pd.DataFrame()
+
+        result = pd.concat(all_frames, ignore_index=True)
+        result[timestamp_col] = pd.to_datetime(
+            result[timestamp_col].astype(int), unit="ms", utc=True
+        )
+        result["symbol"] = symbol.upper()
+
+        # Convert numeric columns
+        for col in result.columns:
+            if col not in (timestamp_col, "symbol"):
+                try:
+                    result[col] = pd.to_numeric(result[col])
+                except (ValueError, TypeError):
+                    pass
+
+        result = result.drop_duplicates(subset=[timestamp_col, "symbol"]).reset_index(drop=True)
+        logger.info(f"Fetched {len(result)} records from {endpoint} for {symbol}")
+        return result
+
+    async def fetch_open_interest_history(
+        self,
+        symbol: str,
+        period: str = "1h",
+        start: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch Open Interest history (last 30 days only)."""
+        return await self._paginate_futures(
+            endpoint="/futures/data/openInterestHist",
+            symbol=symbol,
+            period=period,
+            limit=500,
+            start=start,
+            max_age_days=30,
+            timestamp_col="timestamp",
+        )
+
+    async def fetch_funding_rate(
+        self,
+        symbol: str,
+        start: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch Funding Rate history (deep history available)."""
+        df = await self._paginate_futures(
+            endpoint="/fapi/v1/fundingRate",
+            symbol=symbol,
+            period=None,
+            limit=1000,
+            start=start,
+            max_age_days=None,  # No limit — deep history
+            timestamp_col="fundingTime",
+        )
+        if not df.empty:
+            df = df.rename(columns={"fundingTime": "timestamp"})
+        return df
+
+    async def fetch_long_short_ratio(
+        self,
+        symbol: str,
+        period: str = "1h",
+        start: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch Global Long/Short Ratio (last 30 days only)."""
+        return await self._paginate_futures(
+            endpoint="/futures/data/globalLongShortAccountRatio",
+            symbol=symbol,
+            period=period,
+            limit=500,
+            start=start,
+            max_age_days=30,
+            timestamp_col="timestamp",
+        )
+
+    async def fetch_taker_buy_sell_volume(
+        self,
+        symbol: str,
+        period: str = "1h",
+        start: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch Taker Buy/Sell Volume ratio (last 30 days only)."""
+        return await self._paginate_futures(
+            endpoint="/futures/data/takerlongshortRatio",
+            symbol=symbol,
+            period=period,
+            limit=500,
+            start=start,
+            max_age_days=30,
+            timestamp_col="timestamp",
+        )
 
     async def stream_klines(
         self,
