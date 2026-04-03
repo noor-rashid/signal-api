@@ -14,6 +14,15 @@ from signal_api.features.derivatives import (
     VolumeWeightedOIChange,
 )
 from signal_api.features.spot import TakerBuyRatio, TradeIntensity
+from signal_api.features.volatility import (
+    DownsideVolRatio,
+    FundingVolSpread,
+    RealizedVolatility,
+    ReturnSkewness,
+    TailConcentration,
+    VolatilityZScore,
+    VolOfVol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +38,16 @@ ALL_DERIVATIVES_FEATURES: list[Feature] = [
     FundingRateMomentum(),
     LongShortRatioExtremes(),
     VolumeWeightedOIChange(),
+]
+
+ALL_VOLATILITY_FEATURES: list[Feature] = [
+    RealizedVolatility(),
+    VolatilityZScore(),
+    VolOfVol(),
+    DownsideVolRatio(),
+    ReturnSkewness(),
+    TailConcentration(),
+    FundingVolSpread(),
 ]
 
 
@@ -47,7 +66,7 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     for feature in ALL_SPOT_FEATURES:
         result[feature.name] = feature.compute(result)
 
-    for feature in ALL_DERIVATIVES_FEATURES:
+    for feature in ALL_DERIVATIVES_FEATURES + ALL_VOLATILITY_FEATURES:
         try:
             feature.validate_input(result)
             result[feature.name] = feature.compute(result)
